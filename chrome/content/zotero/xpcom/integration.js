@@ -873,6 +873,14 @@ Zotero.Integration.Interface.prototype.getFieldsHeadless = async function () {
 				let field = await Zotero.Integration.Field.loadExisting(docField);
 				if (field.type !== INTEGRATION_TYPE_ITEM) continue;
 				let data = await field.unserialize();
+				// docField._id is the field's own identifier as reported by the document
+				// plugin (Zotero.HTTPIntegrationClient.Field#_id) -- for Google Docs this is
+				// the same 6-char key used in both the visible citation link's URL
+				// (zotero.org/google-docs/?<key>) and the Z_F<key> NamedRange name. It's
+				// distinct from data.citationID, which is citeproc's own cluster-tracking ID.
+				// The extension correlates a hovered link's key against this field to know
+				// which citationItems/itemData to show.
+				data.fieldKey = docField._id;
 				result.push(data);
 			}
 		}
