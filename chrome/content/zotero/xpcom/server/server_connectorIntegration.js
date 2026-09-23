@@ -165,3 +165,36 @@ Zotero.Server.Endpoints['/connector/document/getHeadlessResult'].prototype = {
 		}
 	}
 };
+
+/**
+ * ---- zotero.ai headless citation extension ----
+ *
+ * Escape hatch for Zotero's own Integration single-flight guard (Zotero.Integration.
+ * currentDoc), which has no timeout of its own: if a headless command's browser-side round
+ * trip never completes (the multi-step execCommand/respond handshake can, in practice,
+ * occasionally not make it all the way back -- see the zotero.ai companion extension's
+ * zotero-local-server.js for the full explanation), currentDoc is left permanently true and
+ * every subsequent integration command -- ours or a normal interactive one -- hits the "A
+ * word processor integration command is already running" alert forever, until Zotero is
+ * restarted. The companion extension calls this after ITS OWN getHeadlessResult call times
+ * out, on the assumption that a timeout on our side means our own command is what's stuck.
+ *
+ * This is blunt (it does not try to distinguish "our command hung" from "a real interactive
+ * dialog is legitimately still open"), so it is only ever called automatically after our own
+ * timeout, never speculatively.
+ */
+Zotero.Server.Endpoints['/connector/document/forceResetIntegration'] = function() {};
+Zotero.Server.Endpoints['/connector/document/forceResetIntegration'].prototype = {
+	supportedMethods: ["POST"],
+	supportedDataTypes: ["application/json"],
+	permitBookmarklet: true,
+	allowRequestsFromUnsafeWebContent: true,
+	init: function (data, sendResponse) {
+		Zotero.Integration.currentDoc = false;
+		Zotero.Integration.currentWindow = false;
+		Zotero.Integration.currentSession = false;
+		Zotero.HTTPIntegrationClient.inProgress = false;
+		Zotero.Integration.pendingHeadlessRequest = null;
+		sendResponse(200, 'application/json', JSON.stringify({ ok: true }));
+	}
+};
