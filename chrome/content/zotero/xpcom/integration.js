@@ -683,6 +683,15 @@ Zotero.Integration.DELETE = 2;
 Zotero.Integration.REMOVE_CODE = 3;
 
 /**
+ * ---- zotero.ai headless citation extension ----
+ * Holds at most one in-flight headless request set via the
+ * /connector/document/setHeadlessRequest endpoint (server_connectorIntegration.js) and
+ * consumed by Interface#addCitationHeadless / #getFieldsHeadless below. See that file for
+ * why this indirection exists (the execCommand/respond protocol has no payload/return channel).
+ */
+Zotero.Integration.pendingHeadlessRequest = null;
+
+/**
  * All methods for interacting with a document
  * @constructor
  */
@@ -785,6 +794,94 @@ Zotero.Integration.Interface.prototype.addAnnotation = async function () {
 	}
 	else {
 		return this._session.updateDocument(FORCE_CITATIONS_FALSE, false, false);
+	}
+};
+
+/**
+ * ---- zotero.ai headless citation extension ----
+ *
+ * Inserts a citation for one or more already-identified library items with no interactive
+ * dialog, using the request stashed via /connector/document/setHeadlessRequest. Mirrors
+ * addCitation() above, but replaces the citationDialog.xhtml round trip (Session#cite) with
+ * Session#citeHeadless, which performs the same citeproc formatting / field-writing using a
+ * caller-supplied citationItems array instead of one built by a human in the dialog.
+ *
+ * Expected pendingHeadlessRequest.data shape:
+ *   {
+ *     citationItems: [{ key, libraryID, locator?, label?, prefix?, suffix? }, ...],
+ *     properties?: {},
+ *     docPrefs?: { styleID, fieldType }  // only used to silently initialize a brand-new
+ *                                        // document that has never had Zotero prefs set
+ *   }
+ */
+Zotero.Integration.Interface.prototype.addCitationHeadless = async function () {
+	var req = Zotero.Integration.pendingHeadlessRequest;
+	if (!req) {
+		throw new Zotero.Exception.Alert("integration.error.headlessNoPendingRequest", [],
+			"integration.error.title");
+	}
+	try {
+		await this._session.init(false, true);
+		if (!this._session.data.prefs.fieldType) {
+			let docPrefs = req.data.docPrefs;
+			if (!docPrefs || !docPrefs.styleID || !docPrefs.fieldType) {
+				throw new Zotero.Exception.Alert("integration.error.headlessDocPrefsRequired", [],
+					"integration.error.title");
+			}
+			await this._session.setDocPrefsHeadless(docPrefs.styleID, docPrefs.fieldType);
+		}
+
+		let citations = await this._session.citeHeadless(req.data.citationItems, req.data.properties);
+		let result;
+		if (this._session.data.prefs.delayCitationUpdates) {
+			for (let citation of citations) {
+				await this._session.writeDelayedCitation(citation.field, citation);
+			}
+			result = { inserted: citations.length };
+		}
+		else {
+			await this._session.updateDocument(FORCE_CITATIONS_FALSE, false, false);
+			result = { inserted: citations.length };
+		}
+		req.resultDeferred.resolve(result);
+	}
+	catch (e) {
+		req.resultDeferred.resolve({ error: e.message || String(e) });
+		throw e;
+	}
+};
+
+/**
+ * ---- zotero.ai headless citation extension ----
+ *
+ * Returns the decoded citation field data (CSL citationItems/properties, as already cached
+ * in each field's ITEM CSL_CITATION code) for every citation field in the document, with no
+ * interactive dialog and no document mutation. Used to power citation-preview reads.
+ */
+Zotero.Integration.Interface.prototype.getFieldsHeadless = async function () {
+	var req = Zotero.Integration.pendingHeadlessRequest;
+	if (!req) {
+		throw new Zotero.Exception.Alert("integration.error.headlessNoPendingRequest", [],
+			"integration.error.title");
+	}
+	try {
+		await this._session.init(false, true);
+		let result = [];
+		if (this._session.data.prefs.fieldType) {
+			let docFields = await this._session.getFields();
+			for (let docField of docFields) {
+				let field = await Zotero.Integration.Field.loadExisting(docField);
+				if (field.type !== INTEGRATION_TYPE_ITEM) continue;
+				let data = await field.unserialize();
+				result.push(data);
+			}
+		}
+		// else: brand-new document with no Zotero data yet -- nothing to read
+		req.resultDeferred.resolve(result);
+	}
+	catch (e) {
+		req.resultDeferred.resolve({ error: e.message || String(e) });
+		throw e;
 	}
 };
 
@@ -1657,6 +1754,72 @@ Zotero.Integration.Session.prototype.cite = async function (field, addNote=false
 };
 
 /**
+ * ---- zotero.ai headless citation extension ----
+ *
+ * Dialog-free equivalent of Session#cite: instead of opening citationDialog.xhtml and
+ * awaiting a human's picks via a CitationEditInterface, this takes an already-built
+ * citationItems array (as produced by our own AI-ranking step: [{key, libraryID, ...}])
+ * and runs it through the exact same tail Session#cite uses after its dialog resolves --
+ * loadItemData, _insertCitingResult, updateFromDocument, addCitation -- so the resulting
+ * field is indistinguishable from one a human inserted interactively.
+ *
+ * @param {Array} citationItemsData - e.g. [{key, libraryID, locator?, label?, prefix?, suffix?}]
+ * @param {Object} [properties]
+ * @returns {Promise<Array>} inserted Citation objects, as Session#cite would return
+ */
+Zotero.Integration.Session.prototype.citeHeadless = async function (citationItemsData, properties = {}) {
+	var field = new Zotero.Integration.CitationField(await this.addField(true));
+	var citation = new Zotero.Integration.Citation(field, { citationItems: citationItemsData, properties });
+
+	// promptToReselect=false: throw MissingItemException instead of opening a reselect-item
+	// dialog if a key/libraryID can't be resolved to a real library item.
+	var loadResult = await citation.loadItemData(false);
+	if (loadResult === Zotero.Integration.DELETE) {
+		try { await field.delete(); } catch (e) {}
+		throw new Zotero.Exception.Alert("integration.error.headlessCitationEmpty", [],
+			"integration.error.title");
+	}
+
+	// Locate the field's index among current fields, and bring session bookkeeping up to
+	// date, mirroring the non-delayed branch of Session#cite's fieldIndexPromise/
+	// citationsByItemIDPromise setup (there's no dialog here to run those in parallel with).
+	var fieldIndex = -1;
+	var fields = await this.getFields();
+	for (var i = 0, n = fields.length; i < n; i++) {
+		if (await fields[i].equals(field._field)) {
+			field = new Zotero.Integration.CitationField(fields[i]);
+			fieldIndex = i;
+			break;
+		}
+	}
+	await this.updateFromDocument(FORCE_CITATIONS_FALSE);
+
+	var citations;
+	try {
+		citations = await this._insertCitingResult(fieldIndex, field, citation);
+	}
+	catch (e) {
+		try { await field.delete(); } catch (e2) {}
+		throw e;
+	}
+
+	var refetchedFields;
+	if (!this.data.prefs.delayCitationUpdates) {
+		if (citations.length != 1) {
+			refetchedFields = await this.getFields(true);
+		}
+		await this.updateFromDocument(FORCE_CITATIONS_FALSE);
+	}
+	for (let c of citations) {
+		if (refetchedFields) {
+			c.field = new Zotero.Integration.CitationField(refetchedFields[c.fieldIndex]);
+		}
+		await this.addCitation(c.fieldIndex, await c.field.getNoteIndex(), c);
+	}
+	return citations;
+};
+
+/**
  * Inserts a citing result, where a citing result is either multiple Items or a Note item.
  * Notes may contain Items in them, which means that
  * a single citing result insert can produce multiple Citations.
@@ -2082,6 +2245,40 @@ Zotero.Integration.Session.prototype.setDocPrefs = async function (showImportExp
 	
 	return oldData || null;
 }
+
+/**
+ * ---- zotero.ai headless citation extension ----
+ *
+ * Dialog-free equivalent of Session#setDocPrefs, used only to silently bootstrap a brand-new
+ * document's style/fieldType (which would otherwise trigger Zotero's interactive
+ * integrationDocPrefs.xhtml picker the first time init() runs) from a caller-supplied default
+ * instead of a human's choice. Mirrors setDocPrefs()'s "on accept" tail exactly, minus the
+ * dialog itself. A document that already has data.prefs.fieldType set never calls this --
+ * see Interface#addCitationHeadless.
+ *
+ * @param {string} styleID - e.g. "http://www.zotero.org/styles/apa"
+ * @param {string} fieldType - one of this.primaryFieldType / this.secondaryFieldType
+ */
+Zotero.Integration.Session.prototype.setDocPrefsHeadless = async function (styleID, fieldType) {
+	var oldData = this.data;
+	var data = new Zotero.Integration.DocumentData();
+	data.dataVersion = oldData.dataVersion;
+	data.sessionID = oldData.sessionID;
+	data.style.styleID = styleID;
+	data.style.bibliographyStyleHasBeenSet = false;
+	data.prefs = oldData ? Object.assign({}, oldData.prefs) : {};
+	data.prefs.fieldType = fieldType;
+	data.prefs.automaticJournalAbbreviations = false;
+	data.prefs.delayCitationUpdates = false;
+
+	await this.setData(data);
+
+	this.data.prefs.noteType = this.style && this.styleClass == "note" ? 1 : 0;
+	this.forceUpdateAllCitations = true;
+	this.rebuildCiteprocState = true;
+
+	return oldData || null;
+};
 
 Zotero.Integration.Session.prototype.exportDocument = async function () {
 	Zotero.debug("Integration: Exporting the document");

@@ -96,3 +96,64 @@ Zotero.Server.Endpoints['/connector/sendToBack'].prototype = {
 		return 200;
 	},
 };
+
+/**
+ * ---- zotero.ai headless citation extension ----
+ *
+ * These two endpoints let a third-party browser extension drive
+ * Zotero.Integration.Interface#addCitationHeadless / #getFieldsHeadless (see integration.js)
+ * without opening the interactive citation dialog. The existing document/execCommand
+ * protocol has no room for a structured payload or a return value (it only carries a
+ * document-edit RPC handshake), so headless callers stash their request here first, then
+ * trigger the command by dispatching the same 'Zotero.Integration.execCommand' window event
+ * the official Google Docs plugin uses (see zotero-google-docs-integration's googleDocs.js),
+ * then poll/await this endpoint for the result.
+ *
+ * Only one headless request is tracked at a time, mirroring the existing single-flight
+ * constraint on HTTP integration commands (Zotero.HTTPIntegrationClient.inProgress).
+ */
+Zotero.Server.Endpoints['/connector/document/setHeadlessRequest'] = function() {};
+Zotero.Server.Endpoints['/connector/document/setHeadlessRequest'].prototype = {
+	supportedMethods: ["POST"],
+	supportedDataTypes: ["application/json"],
+	permitBookmarklet: true,
+	init: function (data, sendResponse) {
+		Zotero.Integration.pendingHeadlessRequest = {
+			data: data || {},
+			resultDeferred: Zotero.Promise.defer()
+		};
+		sendResponse(200, 'application/json', JSON.stringify({ ok: true }));
+	}
+};
+
+Zotero.Server.Endpoints['/connector/document/getHeadlessResult'] = function() {};
+Zotero.Server.Endpoints['/connector/document/getHeadlessResult'].prototype = {
+	supportedMethods: ["POST"],
+	supportedDataTypes: ["application/json"],
+	permitBookmarklet: true,
+	init: async function (data, sendResponse) {
+		var req = Zotero.Integration.pendingHeadlessRequest;
+		if (!req) {
+			sendResponse(404, 'application/json', JSON.stringify({ error: 'No pending headless request' }));
+			return;
+		}
+		var timeoutMs = (data && data.timeoutMs) || 30000;
+		try {
+			var result = await Zotero.Promise.race([
+				req.resultDeferred.promise,
+				Zotero.Promise.delay(timeoutMs).then(() => {
+					throw new Error('Headless request timed out after ' + timeoutMs + 'ms');
+				})
+			]);
+			sendResponse(200, 'application/json', JSON.stringify({ result }));
+		}
+		catch (e) {
+			sendResponse(500, 'application/json', JSON.stringify({ error: e.message }));
+		}
+		finally {
+			if (Zotero.Integration.pendingHeadlessRequest === req) {
+				Zotero.Integration.pendingHeadlessRequest = null;
+			}
+		}
+	}
+};
