@@ -117,6 +117,13 @@ Zotero.Server.Endpoints['/connector/document/setHeadlessRequest'].prototype = {
 	supportedMethods: ["POST"],
 	supportedDataTypes: ["application/json"],
 	permitBookmarklet: true,
+	// Called directly (fetch, not via zotero-connectors) by the zotero.ai companion extension's
+	// background service worker, which has a plain browser User-Agent -- opt in explicitly.
+	// See the security note at the top of this section: without also getting our content
+	// script to fire the matching execCommand event in a real docs.google.com tab (which no
+	// unrelated page can do), stashed data here has no effect, so this is no more sensitive
+	// than the existing browser-reachable endpoints in this file/server_connector.js.
+	allowRequestsFromUnsafeWebContent: true,
 	init: function (data, sendResponse) {
 		Zotero.Integration.pendingHeadlessRequest = {
 			data: data || {},
@@ -131,6 +138,7 @@ Zotero.Server.Endpoints['/connector/document/getHeadlessResult'].prototype = {
 	supportedMethods: ["POST"],
 	supportedDataTypes: ["application/json"],
 	permitBookmarklet: true,
+	allowRequestsFromUnsafeWebContent: true,
 	init: async function (data, sendResponse) {
 		var req = Zotero.Integration.pendingHeadlessRequest;
 		if (!req) {
