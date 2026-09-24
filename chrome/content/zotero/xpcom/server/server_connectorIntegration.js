@@ -100,6 +100,34 @@ Zotero.Server.Endpoints['/connector/sendToBack'].prototype = {
 /**
  * ---- zotero.ai headless citation extension ----
  *
+ * Exposes Zotero's LOCAL library ID for the user's personal library (Zotero.Libraries.
+ * userLibraryID -- an internal SQLite auto-increment id, essentially always 1, but not a value
+ * a browser extension can otherwise know or safely hardcode).
+ *
+ * This exists because of a real, reproduced bug: items synced via the Zotero Web API report
+ * their `library.id` as the user's actual numeric Zotero.org account id (e.g. 1234567) -- a
+ * completely different number from the LOCAL libraryID Zotero desktop uses to look items up.
+ * Passing THAT web-API id as addCitationHeadless's citationItems[].libraryID inserted a citation
+ * field (visibly stuck as the placeholder "{Updating}", its field code left empty -- confirmed
+ * via Document.getFields returning `"code":""` right after insert) that Zotero then couldn't
+ * resolve, surfacing as "An item in this document is missing from your Zotero library." The
+ * companion extension now fetches this once and substitutes it for the web API's library id
+ * before calling addCitationHeadless -- see zotero-local-server.js's getUserLibraryID().
+ */
+Zotero.Server.Endpoints['/connector/getUserLibraryID'] = function() {};
+Zotero.Server.Endpoints['/connector/getUserLibraryID'].prototype = {
+	supportedMethods: ["POST"],
+	supportedDataTypes: ["application/json"],
+	permitBookmarklet: true,
+	allowRequestsFromUnsafeWebContent: true,
+	init: function (data, sendResponse) {
+		sendResponse(200, 'application/json', JSON.stringify({ libraryID: Zotero.Libraries.userLibraryID }));
+	}
+};
+
+/**
+ * ---- zotero.ai headless citation extension ----
+ *
  * These two endpoints let a third-party browser extension drive
  * Zotero.Integration.Interface#addCitationHeadless / #getFieldsHeadless (see integration.js)
  * without opening the interactive citation dialog. The existing document/execCommand
