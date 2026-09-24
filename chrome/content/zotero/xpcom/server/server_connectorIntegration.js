@@ -133,6 +133,26 @@ Zotero.Server.Endpoints['/connector/document/setHeadlessRequest'].prototype = {
 	}
 };
 
+/**
+ * ---- zotero.ai headless citation extension ----
+ *
+ * IMPORTANT: this used to hold the HTTP response open for up to `timeoutMs` (previously
+ * 15-30s) via Promise.race, on the assumption that Zotero's HTTP server (see server.js -- "a
+ * very rudimentary web server" built on Mozilla's httpd.sys.mjs) could still service other
+ * connector requests concurrently while this one was pending. That assumption was wrong:
+ * confirmed in practice that even the official Zotero Connector's own unrelated
+ * /connector/ping requests (nothing to do with document integration) timed out for the exact
+ * duration a headless getHeadlessResult call was held open. That's a deadlock -- the
+ * addCitationHeadless/getFieldsHeadless round trip itself depends on Zotero's server being able
+ * to receive the official connector's execCommand/respond traffic, which our own long-held
+ * connection was blocking.
+ *
+ * Fixed by making this endpoint itself short-poll: wait at most a couple seconds server-side,
+ * then respond either with the real result or {pending: true}, and let the CLIENT (zotero.ai's
+ * background service worker, see zotero-local-server.js) do the long-waiting by calling this
+ * repeatedly. Each individual HTTP round trip is now short, so Zotero's server always has room
+ * to interleave other connector traffic between our polls.
+ */
 Zotero.Server.Endpoints['/connector/document/getHeadlessResult'] = function() {};
 Zotero.Server.Endpoints['/connector/document/getHeadlessResult'].prototype = {
 	supportedMethods: ["POST"],
@@ -145,21 +165,32 @@ Zotero.Server.Endpoints['/connector/document/getHeadlessResult'].prototype = {
 			sendResponse(404, 'application/json', JSON.stringify({ error: 'No pending headless request' }));
 			return;
 		}
-		var timeoutMs = (data && data.timeoutMs) || 30000;
+		// Capped well below the old 15-30s -- this is now just "how long to wait before telling
+		// the client to come back and ask again", not the overall deadline (the client tracks
+		// that itself across repeated calls).
+		var pollMs = Math.min((data && data.pollMs) || 1500, 2000);
+		var settled = false;
 		try {
-			var result = await Zotero.Promise.race([
-				req.resultDeferred.promise,
-				Zotero.Promise.delay(timeoutMs).then(() => {
-					throw new Error('Headless request timed out after ' + timeoutMs + 'ms');
-				})
+			var outcome = await Zotero.Promise.race([
+				req.resultDeferred.promise.then(result => ({ done: true, result })),
+				Zotero.Promise.delay(pollMs).then(() => ({ done: false }))
 			]);
-			sendResponse(200, 'application/json', JSON.stringify({ result }));
+			settled = outcome.done;
+			if (!outcome.done) {
+				sendResponse(200, 'application/json', JSON.stringify({ pending: true }));
+				return;
+			}
+			sendResponse(200, 'application/json', JSON.stringify({ result: outcome.result }));
 		}
 		catch (e) {
+			settled = true; // an actual error (not a mere "still pending") -- don't leave it stuck
 			sendResponse(500, 'application/json', JSON.stringify({ error: e.message }));
 		}
 		finally {
-			if (Zotero.Integration.pendingHeadlessRequest === req) {
+			// Only clear the pending request once it's actually settled -- for a still-pending
+			// outcome we deliberately leave it in place, since the underlying command is still
+			// running and the client's next poll needs to find the same request again.
+			if (settled && Zotero.Integration.pendingHeadlessRequest === req) {
 				Zotero.Integration.pendingHeadlessRequest = null;
 			}
 		}
@@ -190,6 +221,20 @@ Zotero.Server.Endpoints['/connector/document/forceResetIntegration'].prototype =
 	permitBookmarklet: true,
 	allowRequestsFromUnsafeWebContent: true,
 	init: function (data, sendResponse) {
+		// If the official connector's own execCommand/respond HTTP request is still open and
+		// waiting on us (Zotero.HTTPIntegrationClient.sendResponse is how that pending
+		// connection eventually gets completed -- see httpIntegrationClient.js's sendCommand),
+		// resolve it with an error rather than just resetting our state out from under it and
+		// leaving that request to hang forever from the connector's side too.
+		if (Zotero.HTTPIntegrationClient.inProgress && Zotero.HTTPIntegrationClient.sendResponse) {
+			try {
+				Zotero.HTTPIntegrationClient.sendResponse(500, 'application/json',
+					JSON.stringify({ error: 'Integration was force-reset (see forceResetIntegration)' }));
+			}
+			catch (e) {
+				Zotero.debug('[zotero.ai] forceResetIntegration: failed to complete dangling sendResponse: ' + e.message);
+			}
+		}
 		Zotero.Integration.currentDoc = false;
 		Zotero.Integration.currentWindow = false;
 		Zotero.Integration.currentSession = false;
