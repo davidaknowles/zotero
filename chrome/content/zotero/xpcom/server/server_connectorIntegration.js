@@ -268,6 +268,23 @@ Zotero.Server.Endpoints['/connector/document/forceResetIntegration'].prototype =
 		Zotero.Integration.currentSession = false;
 		Zotero.HTTPIntegrationClient.inProgress = false;
 		Zotero.Integration.pendingHeadlessRequest = null;
+		// ---- zotero.ai headless citation extension ----
+		// Root-caused a wedge that survived every other reset here, a browser page reload, and
+		// even toggling the official connector extension off/on -- only a full Zotero restart
+		// cleared it, which was the tell that the stuck state lived in Zotero's own process
+		// memory, not the browser side at all. httpIntegrationClient.js's sendCommand() chains
+		// EVERY call (across ALL documents/tabs -- it's a single module-level variable, not
+		// per-session) onto this one promise: `sendCommandPromise = sendCommandPromise.then(...)`.
+		// If a single sendCommand's response never lands (the multi-step execCommand/respond
+		// handshake not making it all the way back -- see the note above), that promise never
+		// settles, and every future Application.getActiveDocument() (the first sendCommand of
+		// any execCommand, ours or interactive) queues behind the dead one forever -- with zero
+		// Document.*/Application.* traffic ever appearing, since sendCommand() never even gets
+		// far enough to call sendResponse() for the new request. None of the flags above touch
+		// this, so resetting them alone never actually cleared it.
+		if (Zotero.HTTPIntegrationClient.sendCommandPromise) {
+			Zotero.HTTPIntegrationClient.sendCommandPromise = Promise.resolve();
+		}
 		sendResponse(200, 'application/json', JSON.stringify({ ok: true }));
 	}
 };
