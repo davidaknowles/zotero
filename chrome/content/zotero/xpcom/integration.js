@@ -328,10 +328,22 @@ Zotero.Integration = new function () {
 			if (document) {
 				try {
 					await document.cleanup();
-					if (!Zotero.Integration.currentSession?._dontActivateDocument) {
+					// ---- zotero.ai headless citation extension ----
+					// Root-caused via direct user report ("Chrome keeps stealing focus from
+					// other apps"): document.activate() -- which for the Google Docs connector
+					// means bringing that browser tab, and Chrome itself, to the foreground --
+					// used to run completely unconditionally here. getFieldsHeadless is our
+					// background citation-preview poll, firing on a 45s timer regardless of
+					// what the user is doing, so this was silently stealing focus from whatever
+					// other app they were actually using, on a recurring schedule. Deliberately
+					// NOT skipping this for addCitationHeadless too -- unlike the poll, that one
+					// only ever runs from an explicit click in our side panel, which is part of
+					// this same Chrome window, so activation there is a harmless no-op rather
+					// than an unprompted focus steal.
+					if (!Zotero.Integration.currentSession?._dontActivateDocument && command !== 'getFieldsHeadless') {
 						await document.activate();
 					}
-					
+
 					// Call complete function if one exists
 					if (document.complete) {
 						await document.complete();
