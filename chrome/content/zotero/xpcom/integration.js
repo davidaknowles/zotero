@@ -257,6 +257,11 @@ Zotero.Integration = new function () {
 		let deferred = Zotero.Promise.defer();
 		Zotero.Integration.currentCommandPromise = deferred.promise;
 		Zotero.Integration.currentDoc = true;
+		// ---- zotero.ai headless citation extension ----
+		// See shouldAbortCommand()'s note: lets it tell "one of our own background/insert
+		// commands is running" apart from "a real interactive command is stuck", so colliding
+		// with our automatic citation-preview poll doesn't surface a scary system alert.
+		Zotero.Integration.currentIsHeadless = Zotero.Integration.HEADLESS_COMMANDS.has(command);
 
 		var startTime = (new Date()).getTime();
 
@@ -344,6 +349,7 @@ Zotero.Integration = new function () {
 			}
 			
 			Zotero.Integration.currentDoc = Zotero.Integration.currentWindow = false;
+			Zotero.Integration.currentIsHeadless = false;
 			deferred.resolve();
 		}
 	};
@@ -354,7 +360,7 @@ Zotero.Integration = new function () {
 	this.shouldAbortCommand = async function () {
 		const ps = Services.prompt;
 		if (!Zotero.Integration.currentDoc) return false;
-		
+
 		if (Zotero.Integration.currentWindow) {
 			if (!Zotero.Integration.currentWindow.isPristine) {
 				Zotero.Utilities.Internal.activate();
@@ -372,6 +378,23 @@ Zotero.Integration = new function () {
 			}
 			Zotero.Integration.currentWindow.cancel();
 			await Zotero.Integration.currentCommandPromise;
+		}
+		else if (Zotero.Integration.currentIsHeadless) {
+			// ---- zotero.ai headless citation extension ----
+			// Confirmed via direct user report ("A word processor integration command is
+			// already running" showing up repeatedly): our own background citation-preview poll
+			// runs automatically every 45s, with no interactive window (currentWindow is never
+			// set for a headless command), so this branch -- previously unconditional -- fired
+			// this exact system alert dialog every time the native menu happened to be used
+			// while one of our own headless commands (a poll, or an insert) was still in
+			// flight. That's a real but short-lived and totally routine collision, not the
+			// "something is stuck" situation this alert exists to report -- so abort silently
+			// instead of surfacing a scary dialog for what's really just "try again in a
+			// moment". A genuinely stuck headless command still self-clears via
+			// forceResetIntegration's automatic timeout-triggered call (see
+			// server_connectorIntegration.js), same as before this change.
+			Zotero.debug('Integration: a zotero.ai headless command is in progress -- aborting new command silently');
+			return true;
 		}
 		else {
 			// Prompt the user that an integration command is already running
@@ -690,6 +713,17 @@ Zotero.Integration.REMOVE_CODE = 3;
  * why this indirection exists (the execCommand/respond protocol has no payload/return channel).
  */
 Zotero.Integration.pendingHeadlessRequest = null;
+
+/**
+ * ---- zotero.ai headless citation extension ----
+ * Command names dispatched by our own headless callers, as opposed to a real interactive
+ * command triggered by a human via the Zotero menu. Used by execCommand/shouldAbortCommand
+ * (see the currentIsHeadless note there) to tell "one of our own commands is running" apart
+ * from "a real interactive command is stuck", so that colliding with our automatic citation-
+ * preview poll doesn't surface a scary "integration command already running" system alert.
+ */
+Zotero.Integration.HEADLESS_COMMANDS = new Set(['addCitationHeadless', 'getFieldsHeadless']);
+Zotero.Integration.currentIsHeadless = false;
 
 /**
  * All methods for interacting with a document

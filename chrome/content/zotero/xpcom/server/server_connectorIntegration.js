@@ -266,6 +266,7 @@ Zotero.Server.Endpoints['/connector/document/forceResetIntegration'].prototype =
 		Zotero.Integration.currentDoc = false;
 		Zotero.Integration.currentWindow = false;
 		Zotero.Integration.currentSession = false;
+		Zotero.Integration.currentIsHeadless = false;
 		Zotero.HTTPIntegrationClient.inProgress = false;
 		Zotero.Integration.pendingHeadlessRequest = null;
 		// ---- zotero.ai headless citation extension ----
