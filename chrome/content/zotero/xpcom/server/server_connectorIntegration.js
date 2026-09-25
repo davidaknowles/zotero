@@ -289,3 +289,41 @@ Zotero.Server.Endpoints['/connector/document/forceResetIntegration'].prototype =
 		sendResponse(200, 'application/json', JSON.stringify({ ok: true }));
 	}
 };
+
+/**
+ * ---- zotero.ai headless citation extension ----
+ *
+ * The preview popover's "View in Zotero" button used to open a zotero://select/... URL, which
+ * goes through the OS's own custom-URL-scheme handler -- and on a dev machine with both a
+ * normal Zotero install and this patched fork present, that handler is registered to whichever
+ * one the OS picked (confirmed: not reliably the one actually running). Since the companion
+ * extension already has a direct HTTP connection to exactly the running instance we want, this
+ * sidesteps the OS entirely and asks that instance to select the item itself.
+ */
+Zotero.Server.Endpoints['/connector/selectItem'] = function() {};
+Zotero.Server.Endpoints['/connector/selectItem'].prototype = {
+	supportedMethods: ["POST"],
+	supportedDataTypes: ["application/json"],
+	permitBookmarklet: true,
+	allowRequestsFromUnsafeWebContent: true,
+	init: async function (data, sendResponse) {
+		try {
+			let item = await Zotero.Items.getByLibraryAndKeyAsync(data.libraryID, data.key);
+			if (!item) {
+				sendResponse(404, 'application/json', JSON.stringify({ error: 'Item not found' }));
+				return;
+			}
+			let win = Zotero.getMainWindow();
+			if (!win) {
+				sendResponse(500, 'application/json', JSON.stringify({ error: 'No open Zotero window' }));
+				return;
+			}
+			Zotero.Utilities.Internal.activate(win);
+			await win.ZoteroPane.selectItem(item.id);
+			sendResponse(200, 'application/json', JSON.stringify({ ok: true }));
+		}
+		catch (e) {
+			sendResponse(500, 'application/json', JSON.stringify({ error: e.message }));
+		}
+	}
+};
