@@ -1816,14 +1816,41 @@ Zotero.Integration.Session.prototype.cite = async function (field, addNote=false
  * @returns {Promise<Array>} inserted Citation objects, as Session#cite would return
  */
 Zotero.Integration.Session.prototype.citeHeadless = async function (citationItemsData, properties = {}) {
-	var field = new Zotero.Integration.CitationField(await this.addFieldHeadless(true));
-	var citation = new Zotero.Integration.Citation(field, { citationItems: citationItemsData, properties });
+	// ---- zotero.ai headless citation extension ----
+	// Root-caused a real bug via user report ("Zhu et al got replaced by Wainberg et al"): this
+	// used to always insert a brand-new field, discarding whatever citation was already at the
+	// cursor. Session#cite's interactive path handles "cursor is already inside a citation"
+	// differently -- it loads that field's EXISTING citationItems and the dialog lets the user
+	// add more alongside them, rather than starting from empty. We have no dialog, so replicate
+	// just the "load existing, then add to it" half directly, using Citation's own
+	// mergeCitation() (dedupes by item id, so re-adding the same reference is a no-op rather
+	// than a duplicate).
+	var field, citation, newField = false;
+	var docField = await this._doc.cursorInField(this.data.prefs['fieldType']);
+	if (docField) {
+		let existingField = await Zotero.Integration.Field.loadExisting(docField);
+		if (existingField.type === INTEGRATION_TYPE_ITEM) {
+			field = existingField;
+			citation = new Zotero.Integration.Citation(field, await field.unserialize(), await field.getNoteIndex());
+			citation.mergeCitation(new Zotero.Integration.Citation(field, { citationItems: citationItemsData }));
+		}
+		// Any other field type at the cursor (bibliography, or a non-item placeholder) -- don't
+		// try to merge into that; fall through to inserting a fresh field instead, same as if
+		// there were no field at the cursor at all.
+	}
+	if (!citation) {
+		newField = true;
+		field = new Zotero.Integration.CitationField(await this.addFieldHeadless(true));
+		citation = new Zotero.Integration.Citation(field, { citationItems: citationItemsData, properties });
+	}
 
 	// promptToReselect=false: throw MissingItemException instead of opening a reselect-item
 	// dialog if a key/libraryID can't be resolved to a real library item.
 	var loadResult = await citation.loadItemData(false);
 	if (loadResult === Zotero.Integration.DELETE) {
-		try { await field.delete(); } catch (e) {}
+		if (newField) {
+			try { await field.delete(); } catch (e) {}
+		}
 		throw new Zotero.Exception.Alert("integration.error.headlessCitationEmpty", [],
 			"integration.error.title");
 	}
@@ -1847,7 +1874,12 @@ Zotero.Integration.Session.prototype.citeHeadless = async function (citationItem
 		citations = await this._insertCitingResult(fieldIndex, field, citation);
 	}
 	catch (e) {
-		try { await field.delete(); } catch (e2) {}
+		// Only clean up a field we created ourselves this call -- for an existing field we're
+		// merging into, deleting it on error would destroy whatever was already legitimately
+		// cited there before we ever touched it.
+		if (newField) {
+			try { await field.delete(); } catch (e2) {}
+		}
 		throw e;
 	}
 
