@@ -1208,6 +1208,46 @@ Zotero.Integration.Session.prototype.addField = async function (note, fieldIndex
 }
 
 /**
+ * ---- zotero.ai headless citation extension ----
+ *
+ * Headless equivalent of addField() above, used by citeHeadless(). Deliberately skips the
+ * cursorInField()/displayAlert("integration.replace") branch: that prompt exists to ask a human
+ * "replace the citation your cursor is already inside?", but a headless caller has no user
+ * available to answer it, and -- confirmed via a real crash -- the official Google Docs
+ * connector's own displayAlert implementation (zotero-google-docs-integration's ui.js) throws
+ * "TypeError: Cannot read properties of null (reading 'button')" when invoked with no real
+ * dialog surface to interact with (e.g. because the doc's cursor was left inside a
+ * previously-inserted citation from an earlier headless insert). A headless insert always means
+ * "add a new citation here", never "replace what's already at the cursor" -- so this always
+ * inserts a fresh field instead of reusing/prompting about one already at the cursor position.
+ */
+Zotero.Integration.Session.prototype.addFieldHeadless = async function (note, fieldIndex=-1) {
+	if (!(await this._doc.canInsertField(this.data.prefs['fieldType']))) {
+		return Promise.reject(new Zotero.Exception.Alert("integration.error.cannotInsertHere",
+		[], "integration.error.title"));
+	}
+
+	var field = await this._doc.insertField(this.data.prefs['fieldType'],
+		(note ? this.data.prefs["noteType"] : 0));
+	// Older doc plugins do not initialize the field code to anything meaningful
+	// so we ensure it here manually
+	field.setCode('TEMP');
+
+	// If fields already retrieved, further this.getFields() calls will returned the cached version
+	// So add this field to the cache
+	if (this._fields) {
+		if (fieldIndex == -1) {
+			this._fields.push(field);
+		}
+		else {
+			this._fields.splice(fieldIndex, 0, field);
+		}
+	}
+
+	return field;
+}
+
+/**
  * Gets all fields for a document
  * @return {Promise} Promise resolved with field list.
  */
@@ -1776,7 +1816,7 @@ Zotero.Integration.Session.prototype.cite = async function (field, addNote=false
  * @returns {Promise<Array>} inserted Citation objects, as Session#cite would return
  */
 Zotero.Integration.Session.prototype.citeHeadless = async function (citationItemsData, properties = {}) {
-	var field = new Zotero.Integration.CitationField(await this.addField(true));
+	var field = new Zotero.Integration.CitationField(await this.addFieldHeadless(true));
 	var citation = new Zotero.Integration.Citation(field, { citationItems: citationItemsData, properties });
 
 	// promptToReselect=false: throw MissingItemException instead of opening a reselect-item
